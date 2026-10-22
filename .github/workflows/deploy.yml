@@ -2,15 +2,18 @@ name: Deploy portfolio to GitHub Pages
 
 on:
   workflow_dispatch:
+  repository_dispatch:
+    types:
+      - portfolio-master-updated
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -19,8 +22,96 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Clone portfolio master
-        run: git clone --depth 1 --branch master https://github.com/Biplab-Mandal/portfolio.git source
+      - name: Resolve portfolio revision
+        id: source-revision
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        with:
+          script: |
+            const owner = "Biplab-Mandal";
+            const repo = "portfolio";
+            const ref = "heads/master";
+            const eventName = context.eventName;
+
+            let dispatchedSha = null;
+
+            if (eventName === "repository_dispatch") {
+              const payload = context.payload.client_payload ?? {};
+              const attempt = payload.recovery_attempt;
+
+              if (!Number.isInteger(attempt) || (attempt !== 0 && attempt !== 1)) {
+                core.setFailed("repository_dispatch recovery_attempt must be the integer 0 or 1.");
+                return;
+              }
+
+              dispatchedSha = process.env.SOURCE_SHA;
+              if (!/^[0-9a-f]{40}$/.test(dispatchedSha ?? "")) {
+                core.setFailed("repository_dispatch source_sha must be exactly 40 lowercase hexadecimal characters.");
+                return;
+              }
+            } else if (eventName !== "workflow_dispatch") {
+              core.setFailed(`Unsupported event: ${eventName}`);
+              return;
+            }
+
+            async function readMasterSha() {
+              const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/${ref}`;
+              const response = await fetch(url, {
+                headers: { Accept: "application/vnd.github+json" },
+              });
+
+              if (!response.ok) {
+                throw new Error(`GitHub API returned HTTP ${response.status} for ${owner}/${repo} ${ref}.`);
+              }
+
+              const data = await response.json();
+              const sha = data?.object?.sha;
+              if (!/^[0-9a-f]{40}$/.test(sha ?? "")) {
+                throw new Error(`GitHub API returned an invalid SHA for ${owner}/${repo} ${ref}.`);
+              }
+              return sha;
+            }
+
+            let masterSha;
+            try {
+              masterSha = await readMasterSha();
+            } catch (error) {
+              core.setFailed(`Could not resolve public ${owner}/${repo} ${ref}: ${String(error)}`);
+              return;
+            }
+
+            const selectedSha =
+              eventName === "workflow_dispatch" || dispatchedSha !== masterSha
+                ? masterSha
+                : dispatchedSha;
+
+            if (eventName === "repository_dispatch" && dispatchedSha !== masterSha) {
+              core.notice(`Dispatched SHA was superseded; using current master ${masterSha}.`);
+            }
+
+            core.setOutput("sha", selectedSha);
+            core.info(`Selected portfolio commit: ${selectedSha}`);
+
+      - name: Clone portfolio at selected revision
+        id: clone-source
+        env:
+          SOURCE_SHA: ${{ steps.source-revision.outputs.sha }}
+        run: |
+          git clone --depth 1 --branch master https://github.com/Biplab-Mandal/portfolio.git source
+          if [[ "$(git -C source rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            git -C source fetch --depth=1 origin "$SOURCE_SHA"
+            git -C source checkout --detach FETCH_HEAD
+          fi
+
+          ACTUAL_SHA="$(git -C source rev-parse HEAD)"
+          if [[ "$ACTUAL_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::Checked out $ACTUAL_SHA but expected $SOURCE_SHA."
+            exit 1
+          fi
+
+          echo "Portfolio commit: $ACTUAL_SHA"
+          echo "sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -39,6 +130,98 @@ jobs:
         env:
           NEXT_STATIC_EXPORT: "true"
 
+      - name: Verify source is current before artifact upload
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ steps.clone-source.outputs.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = "Biplab-Mandal";
+            const repo = "portfolio";
+            const ref = "heads/master";
+            const eventName = context.eventName;
+
+            if (!/^[0-9a-f]{40}$/.test(process.env.SOURCE_SHA ?? "")) {
+              core.setFailed("Missing or invalid checked-out SHA from steps.clone-source.outputs.sha.");
+              return;
+            }
+
+            let attempt = null;
+            if (eventName === "repository_dispatch") {
+              attempt = context.payload.client_payload?.recovery_attempt;
+              if (!Number.isInteger(attempt) || (attempt !== 0 && attempt !== 1)) {
+                core.setFailed("repository_dispatch recovery_attempt must be the integer 0 or 1.");
+                return;
+              }
+            } else if (eventName !== "workflow_dispatch") {
+              core.setFailed(`Unsupported event: ${eventName}`);
+              return;
+            }
+
+            async function readMasterSha() {
+              const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/${ref}`;
+              const response = await fetch(url, {
+                headers: { Accept: "application/vnd.github+json" },
+              });
+
+              if (!response.ok) {
+                throw new Error(`GitHub API returned HTTP ${response.status} for ${owner}/${repo} ${ref}.`);
+              }
+
+              const data = await response.json();
+              const sha = data?.object?.sha;
+              if (!/^[0-9a-f]{40}$/.test(sha ?? "")) {
+                throw new Error(`GitHub API returned an invalid SHA for ${owner}/${repo} ${ref}.`);
+              }
+              return sha;
+            }
+
+            let masterSha;
+            try {
+              masterSha = await readMasterSha();
+            } catch (error) {
+              core.setFailed(`Could not resolve public ${owner}/${repo} ${ref}: ${String(error)}`);
+              return;
+            }
+
+            const sourceSha = process.env.SOURCE_SHA;
+            if (sourceSha === masterSha) {
+              core.info(`Build is current at ${masterSha}.`);
+              return;
+            }
+
+            const staleMessage =
+              `Stale build: built ${sourceSha}, but ${owner}/${repo} master is ${masterSha}.`;
+
+            if (eventName === "workflow_dispatch") {
+              core.setFailed(`${staleMessage} Rerun the manual deployment to build current master.`);
+              return;
+            }
+
+            if (attempt === 0) {
+              try {
+                await github.rest.repos.createDispatchEvent({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  event_type: "portfolio-master-updated",
+                  client_payload: {
+                    source_sha: masterSha,
+                    recovery_attempt: 1,
+                  },
+                });
+              } catch (error) {
+                core.setFailed(`Could not dispatch the bounded recovery run: ${String(error)}`);
+                return;
+              }
+              core.info("Queued the single recovery deployment.");
+            } else {
+              core.notice("Recovery attempt 1 is stale; no further recovery event will be sent.");
+            }
+
+            core.setFailed(`${staleMessage} Refusing to upload an outdated artifact.`);
+            return;
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
@@ -46,6 +229,98 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: source/out
+
+      - name: Verify source is current before deployment
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ steps.clone-source.outputs.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = "Biplab-Mandal";
+            const repo = "portfolio";
+            const ref = "heads/master";
+            const eventName = context.eventName;
+
+            if (!/^[0-9a-f]{40}$/.test(process.env.SOURCE_SHA ?? "")) {
+              core.setFailed("Missing or invalid checked-out SHA from steps.clone-source.outputs.sha.");
+              return;
+            }
+
+            let attempt = null;
+            if (eventName === "repository_dispatch") {
+              attempt = context.payload.client_payload?.recovery_attempt;
+              if (!Number.isInteger(attempt) || (attempt !== 0 && attempt !== 1)) {
+                core.setFailed("repository_dispatch recovery_attempt must be the integer 0 or 1.");
+                return;
+              }
+            } else if (eventName !== "workflow_dispatch") {
+              core.setFailed(`Unsupported event: ${eventName}`);
+              return;
+            }
+
+            async function readMasterSha() {
+              const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/${ref}`;
+              const response = await fetch(url, {
+                headers: { Accept: "application/vnd.github+json" },
+              });
+
+              if (!response.ok) {
+                throw new Error(`GitHub API returned HTTP ${response.status} for ${owner}/${repo} ${ref}.`);
+              }
+
+              const data = await response.json();
+              const sha = data?.object?.sha;
+              if (!/^[0-9a-f]{40}$/.test(sha ?? "")) {
+                throw new Error(`GitHub API returned an invalid SHA for ${owner}/${repo} ${ref}.`);
+              }
+              return sha;
+            }
+
+            let masterSha;
+            try {
+              masterSha = await readMasterSha();
+            } catch (error) {
+              core.setFailed(`Could not resolve public ${owner}/${repo} ${ref}: ${String(error)}`);
+              return;
+            }
+
+            const sourceSha = process.env.SOURCE_SHA;
+            if (sourceSha === masterSha) {
+              core.info(`Artifact is current at ${masterSha}.`);
+              return;
+            }
+
+            const staleMessage =
+              `Stale artifact: built ${sourceSha}, but ${owner}/${repo} master is ${masterSha}.`;
+
+            if (eventName === "workflow_dispatch") {
+              core.setFailed(`${staleMessage} Rerun the manual deployment to build current master.`);
+              return;
+            }
+
+            if (attempt === 0) {
+              try {
+                await github.rest.repos.createDispatchEvent({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  event_type: "portfolio-master-updated",
+                  client_payload: {
+                    source_sha: masterSha,
+                    recovery_attempt: 1,
+                  },
+                });
+              } catch (error) {
+                core.setFailed(`Could not dispatch the bounded recovery run: ${String(error)}`);
+                return;
+              }
+              core.info("Queued the single recovery deployment.");
+            } else {
+              core.notice("Recovery attempt 1 is stale; no further recovery event will be sent.");
+            }
+
+            core.setFailed(`${staleMessage} Refusing to deploy an outdated artifact.`);
+            return;
 
       - name: Deploy to GitHub Pages
         id: deployment
